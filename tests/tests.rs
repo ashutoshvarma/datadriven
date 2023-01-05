@@ -1,4 +1,4 @@
-use datadriven::{walk, walk_async};
+use datadriven::{walk, walk_async, Result};
 
 #[cfg(test)]
 mod tests {
@@ -7,11 +7,11 @@ mod tests {
     #[test]
     fn run() {
         walk("tests/testdata", |f| {
-            f.run(|s| -> String {
+            f.run(|s| -> Result<String> {
                 let mut result = String::new();
                 result.push_str(&s.input.trim());
                 result.push_str("\n");
-                result
+                Ok(result)
             })
         });
     }

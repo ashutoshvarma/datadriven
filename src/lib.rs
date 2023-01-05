@@ -1,14 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 use std::fs;
 use std::path::PathBuf;
-use std::result::Result;
 
 use anyhow::{bail, Context, Error};
 
 #[cfg(feature = "async")]
 use futures::future::Future;
+
+pub type Result<T> = anyhow::Result<T, Error>;
 
 /// A single test case within a file.
 #[derive(Debug, Clone)]
@@ -70,7 +71,7 @@ fn should_ignore_file(name: &str) -> bool {
 }
 
 // Extracts all the non-directory children of dir. Not defensive against cycles!
-fn test_files(dir: PathBuf) -> Result<Vec<PathBuf>, Error> {
+fn test_files(dir: PathBuf) -> Result<Vec<PathBuf>> {
     let mut q = VecDeque::new();
     q.push_back(dir);
     let mut res = vec![];
@@ -142,7 +143,7 @@ impl DirectiveParser {
             || ch == '.'
     }
 
-    fn parse_word(&mut self, context: &str) -> Result<String, Error> {
+    fn parse_word(&mut self, context: &str) -> Result<String> {
         let start = self.idx;
         while self.peek().map_or(false, Self::is_wordchar) {
             self.idx += 1;
@@ -162,14 +163,14 @@ impl DirectiveParser {
         self.idx >= self.chars.len()
     }
 
-    fn parse_arg(&mut self) -> Result<(String, Vec<String>), Error> {
+    fn parse_arg(&mut self) -> Result<(String, Vec<String>)> {
         let name = self.parse_word("argument name")?;
         let vals = self.parse_vals()?;
         Ok((name, vals))
     }
 
     // Parses an argument value, including the leading `=`.
-    fn parse_vals(&mut self) -> Result<Vec<String>, Error> {
+    fn parse_vals(&mut self) -> Result<Vec<String>> {
         if !self.eat('=') {
             return Ok(Vec::new());
         }
@@ -197,7 +198,7 @@ impl DirectiveParser {
         Ok(vals)
     }
 
-    fn parse_directive(&mut self) -> Result<(String, HashMap<String, Vec<String>>), Error> {
+    fn parse_directive(&mut self) -> Result<(String, HashMap<String, Vec<String>>)> {
         self.munch();
         let directive = self.parse_word("directive")?;
         let mut args = HashMap::new();
@@ -247,7 +248,7 @@ where
 }
 
 impl TestFile {
-    fn new(filename: &PathBuf) -> Result<Self, Error> {
+    fn new(filename: &PathBuf) -> Result<Self> {
         let contents = fs::read_to_string(filename)
             .with_context(|| format!("error reading file {}", filename.display()))?;
         let mut res = match Self::parse(&contents) {
@@ -258,12 +259,25 @@ impl TestFile {
         Ok(res)
     }
 
+    fn make_error<E: Display>(&self, case: &TestCase, error: E) -> String {
+        format!(
+            "failure:\n{}:{}:\n{}\nexpected:\n{}\nerror:\n{}",
+            self.filename
+                .as_ref()
+                .unwrap_or(&"<unknown file>".to_string()),
+            case.line_number,
+            case.input,
+            case.expected,
+            error
+        )
+    }
+
     /// Run each test in this file in sequence by calling `f` on it. If any test fails, execution
     /// halts. If the REWRITE environment variable is set, it will rewrite each file as it
     /// processes it.
     pub fn run<F>(&mut self, f: F)
     where
-        F: FnMut(&TestCase) -> String,
+        F: FnMut(&TestCase) -> anyhow::Result<String>,
     {
         match env::var("REWRITE") {
             Ok(_) => self.run_rewrite(f),
@@ -273,24 +287,34 @@ impl TestFile {
 
     fn run_normal<F>(&mut self, mut f: F)
     where
-        F: FnMut(&TestCase) -> String,
+        F: FnMut(&TestCase) -> anyhow::Result<String>,
     {
         for stanza in &self.stanzas {
             if let Stanza::Test(case) = stanza {
                 let result = f(&case);
-                if result != case.expected {
-                    self.failure = Some(format!(
-                        "failure:\n{}:{}:\n{}\nexpected:\n{}\nactual:\n{}",
-                        self.filename
-                            .as_ref()
-                            .unwrap_or(&"<unknown file>".to_string()),
-                        case.line_number,
-                        case.input,
-                        case.expected,
-                        result
-                    ));
-                    // Yeah, ok, we're done here.
-                    break;
+                match result {
+                    // we are fine, no errors during test run
+                    Ok(res) => {
+                        if res != case.expected {
+                            self.failure = Some(format!(
+                                "failure:\n{}:{}:\n{}\nexpected:\n{}\nactual:\n{}",
+                                self.filename
+                                    .as_ref()
+                                    .unwrap_or(&"<unknown file>".to_string()),
+                                case.line_number,
+                                case.input,
+                                case.expected,
+                                res
+                            ));
+                            // Yeah, ok, we're done here.
+                            break;
+                        }
+                    }
+                    // oops!
+                    Err(e) => {
+                        self.failure = Some(self.make_error(case, e));
+                        break;
+                    }
                 }
             }
         }
@@ -298,7 +322,7 @@ impl TestFile {
 
     fn run_rewrite<F>(&mut self, mut f: F)
     where
-        F: FnMut(&TestCase) -> String,
+        F: FnMut(&TestCase) -> anyhow::Result<String>,
     {
         let mut s = String::new();
         for stanza in &self.stanzas {
@@ -307,7 +331,14 @@ impl TestFile {
                     s.push_str(&case.directive_line);
                     s.push('\n');
                     s.push_str(&case.input);
-                    write_result(&mut s, f(&case));
+                    match f(&case) {
+                        Ok(r) => write_result(&mut s, r),
+                        Err(e) => {
+                            self.failure = Some(self.make_error(&case, e));
+                            // well, we should stop now.
+                            break;
+                        }
+                    };
                 }
                 Stanza::Comment(c) => {
                     s.push_str(&c);
@@ -315,11 +346,15 @@ impl TestFile {
                 }
             }
         }
-        // TODO(justin): surface these errors somehow?
-        fs::write(self.filename.as_ref().unwrap(), s).unwrap();
+
+        // only write if no test errors
+        if self.failure.is_none() {
+            // TODO(justin): surface these errors somehow?
+            fs::write(self.filename.as_ref().unwrap(), s).unwrap();
+        }
     }
 
-    fn parse(f: &str) -> Result<Self, Error> {
+    fn parse(f: &str) -> Result<Self> {
         let mut stanzas = vec![];
         let lines: Vec<&str> = f.lines().collect();
         let mut i = 0;
@@ -519,14 +554,14 @@ mod tests {
     #[test]
     fn parse_directive() {
         walk("tests/parsing", |f| {
-            f.run(|s| -> String {
+            f.run(|s| -> Result<String> {
                 match DirectiveParser::new(&s.input.trim()).parse_directive() {
                     Ok((directive, mut args)) => {
                         let mut sorted_args = args.drain().collect::<Vec<(String, Vec<String>)>>();
                         sorted_args.sort_by(|a, b| a.0.cmp(&b.0));
-                        format!("directive: {}\nargs: {:?}\n", directive, sorted_args)
+                        Ok(format!("directive: {}\nargs: {:?}\n", directive, sorted_args))
                     }
-                    Err(err) => format!("error: {}\n", err),
+                    Err(err) => Ok(format!("error: {}\n", err)),
                 }
             });
         });
